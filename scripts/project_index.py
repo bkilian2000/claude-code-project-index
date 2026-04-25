@@ -27,8 +27,8 @@ from typing import Dict, List, Optional, Tuple
 from index_utils import (
     IGNORE_DIRS, PARSEABLE_LANGUAGES, CODE_EXTENSIONS, MARKDOWN_EXTENSIONS,
     DIRECTORY_PURPOSES, extract_python_signatures, extract_javascript_signatures,
-    extract_shell_signatures, extract_markdown_structure, infer_file_purpose, 
-    infer_directory_purpose, get_language_name, should_index_file
+    extract_shell_signatures, extract_gdscript_signatures, extract_markdown_structure,
+    infer_file_purpose, infer_directory_purpose, get_language_name, should_index_file
 )
 
 # Limits to keep it fast and simple
@@ -227,6 +227,8 @@ def build_index(root_dir: str) -> Tuple[Dict, int]:
                     extracted = extract_javascript_signatures(content)
                 elif file_path.suffix in {'.sh', '.bash'}:
                     extracted = extract_shell_signatures(content)
+                elif file_path.suffix == '.gd':
+                    extracted = extract_gdscript_signatures(content)
                 else:
                     extracted = {'functions': {}, 'classes': {}}
                 

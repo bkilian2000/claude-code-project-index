@@ -23,8 +23,7 @@ Thumbs.db
 *_old.py
 *_backup.py
 
-# Test outputs
-tests/
+# Debug scripts
 debug_*.py
 
 # Settings backups

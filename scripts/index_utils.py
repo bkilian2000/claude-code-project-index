@@ -20,21 +20,22 @@ IGNORE_DIRS = {
 # Languages we can fully parse (extract functions/classes)
 PARSEABLE_LANGUAGES = {
     '.py': 'python',
-    '.js': 'javascript', 
+    '.js': 'javascript',
     '.ts': 'typescript',
     '.jsx': 'javascript',
     '.tsx': 'typescript',
     '.sh': 'shell',
-    '.bash': 'shell'
+    '.bash': 'shell',
+    '.gd': 'gdscript',
 }
 
 # All code file extensions we recognize
 CODE_EXTENSIONS = {
     # Currently parsed
-    '.py', '.js', '.ts', '.jsx', '.tsx',
+    '.py', '.js', '.ts', '.jsx', '.tsx', '.gd',
     # Common languages (listed but not parsed yet)
-    '.go', '.rs', '.java', '.c', '.cpp', '.cc', '.cxx', 
-    '.h', '.hpp', '.rb', '.php', '.swift', '.kt', '.scala', 
+    '.go', '.rs', '.java', '.c', '.cpp', '.cc', '.cxx',
+    '.h', '.hpp', '.rb', '.php', '.swift', '.kt', '.scala',
     '.cs', '.sh', '.bash', '.sql', '.r', '.R', '.lua', '.m',
     '.ex', '.exs', '.jl', '.dart', '.vue', '.svelte',
     # Configuration and data files
@@ -1180,6 +1181,220 @@ def extract_shell_signatures(content: str) -> Dict[str, any]:
     if not result['sources']:
         del result['sources']
     
+    return result
+
+
+def extract_function_calls_gdscript(body: str, all_functions: Set[str]) -> List[str]:
+    """Extract function calls from GDScript code body."""
+    calls = set()
+
+    call_pattern = r'\b(\w+)\s*\('
+    exclude_keywords = {
+        'if', 'elif', 'while', 'for', 'match', 'func', 'class', 'return',
+        'yield', 'await', 'pass', 'break', 'continue', 'signal', 'var', 'const',
+        'enum', 'static', 'extends', 'is', 'not', 'and', 'or', 'in',
+        'print', 'str', 'int', 'float', 'bool', 'len', 'range', 'typeof',
+        'push_back', 'append', 'Vector2', 'Vector3', 'Color', 'Rect2',
+    }
+
+    for match in re.finditer(call_pattern, body):
+        func_name = match.group(1)
+        if func_name in all_functions and func_name not in exclude_keywords:
+            calls.add(func_name)
+
+    method_pattern = r'(?:self|\w+)\.(\w+)\s*\('
+    for match in re.finditer(method_pattern, body):
+        method_name = match.group(1)
+        if method_name in all_functions:
+            calls.add(method_name)
+
+    return sorted(list(calls))
+
+
+def extract_gdscript_signatures(content: str) -> Dict[str, any]:
+    """Extract GDScript function and class signatures with full details."""
+    result = {
+        'imports': [],
+        'functions': {},
+        'classes': {},
+        'constants': {},
+        'variables': [],
+        'signals': [],
+        'enums': {},
+        'call_graph': {},
+    }
+
+    lines = content.split('\n')
+
+    # First pass: collect all function names for call detection
+    all_function_names = set()
+    for line in lines:
+        func_match = re.match(r'^[ \t]*(?:static\s+)?func\s+(\w+)\s*\(', line)
+        if func_match:
+            all_function_names.add(func_match.group(1))
+
+    # Top-level metadata
+    extends_match = re.search(r'^extends\s+(\S+)', content, re.MULTILINE)
+    if extends_match:
+        result['extends'] = extends_match.group(1)
+
+    class_name_match = re.search(r'^class_name\s+(\w+)', content, re.MULTILINE)
+    if class_name_match:
+        result['class_name'] = class_name_match.group(1)
+
+    # preload / load imports
+    preload_pattern = r'(?:preload|load)\s*\(\s*["\']([^"\']+)["\']\s*\)'
+    for match in re.finditer(preload_pattern, content):
+        path = match.group(1)
+        if path not in result['imports']:
+            result['imports'].append(path)
+
+    # Signals: `signal name` or `signal name(params)`
+    signal_pattern = r'^[ \t]*signal\s+(\w+)(?:\s*\(([^)]*)\))?'
+    for match in re.finditer(signal_pattern, content, re.MULTILINE):
+        sig_name = match.group(1)
+        sig_params = (match.group(2) or '').strip()
+        entry = f"{sig_name}({sig_params})" if sig_params else sig_name
+        result['signals'].append(entry)
+
+    # Enums: `enum Name { A, B }` or anonymous `enum { A, B }`
+    enum_pattern = r'^[ \t]*enum\s+(\w+)?\s*\{([^}]*)\}'
+    for match in re.finditer(enum_pattern, content, re.MULTILINE | re.DOTALL):
+        enum_name = match.group(1) or '_anonymous'
+        enum_body = match.group(2)
+        values = [v.strip().split('=')[0].strip() for v in enum_body.split(',') if v.strip()]
+        result['enums'][enum_name] = {'values': [v for v in values if v]}
+
+    # Constants (module-level, uppercase by convention but GDScript allows any case)
+    const_pattern = r'^[ \t]*const\s+([A-Z_][A-Z0-9_]*)\s*(?::\s*[^=\n]+)?\s*=\s*(.+)$'
+    for match in re.finditer(const_pattern, content, re.MULTILINE):
+        const_name, const_value = match.groups()
+        const_value = const_value.strip()
+        if const_value.startswith(('{', '[')):
+            const_type = 'collection'
+        elif const_value.startswith(('"', "'")):
+            const_type = 'str'
+        elif re.match(r'^-?[\d.]+$', const_value):
+            const_type = 'number'
+        else:
+            const_type = 'value'
+        result['constants'][const_name] = const_type
+
+    # Module-level member variables only (0 indent in GDScript — the file IS the class).
+    # Function-local vars and inner-class vars are excluded deliberately.
+    var_pattern = r'^(?:@\w+(?:\([^)]*\))?\s+)*var\s+(\w+)'
+    for match in re.finditer(var_pattern, content, re.MULTILINE):
+        var_name = match.group(1)
+        if var_name not in result['variables']:
+            result['variables'].append(var_name)
+
+    # Functions and inner classes — walk lines tracking indentation
+    func_pattern = re.compile(
+        r'^([ \t]*)(?:(static)\s+)?func\s+(\w+)\s*\(([^)]*)\)(?:\s*->\s*([^:]+))?:'
+    )
+    inner_class_pattern = re.compile(r'^([ \t]*)class\s+(\w+)(?:\s+extends\s+(\S+))?:')
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+
+        # Inner class
+        cm = inner_class_pattern.match(line)
+        if cm:
+            indent = len(cm.group(1))
+            class_name = cm.group(2)
+            base_class = cm.group(3)
+            doc = None
+            if i > 0 and lines[i - 1].strip().startswith('#'):
+                doc = lines[i - 1].strip().lstrip('#').strip()
+            class_info = {'line': i + 1, 'methods': {}}
+            if base_class:
+                class_info['extends'] = base_class
+            if doc:
+                class_info['doc'] = doc
+            result['classes'][class_name] = class_info
+            i += 1
+            continue
+
+        # Function definition
+        fm = func_pattern.match(line)
+        if fm:
+            func_indent_str = fm.group(1)
+            func_indent = len(func_indent_str)
+            is_static = fm.group(2) is not None
+            func_name = fm.group(3)
+            params_raw = fm.group(4)
+            return_type = fm.group(5)
+
+            # Doc comment: GDScript uses ## for docstrings, # also accepted
+            doc = None
+            if i > 0 and lines[i - 1].strip().startswith('#'):
+                doc = lines[i - 1].strip().lstrip('#').strip()
+
+            # Build signature string
+            params = re.sub(r'\s+', ' ', params_raw).strip()
+            signature = f"({'static ' if is_static else ''}({params})"
+            if is_static:
+                signature = f"static ({params})"
+            else:
+                signature = f"({params})"
+            if return_type:
+                signature += f" -> {return_type.strip()}"
+
+            # Collect function body (lines indented deeper than the func line)
+            body_lines = []
+            j = i + 1
+            while j < len(lines):
+                body_line = lines[j]
+                stripped_body = body_line.strip()
+                if stripped_body == '' or stripped_body.startswith('#'):
+                    body_lines.append(body_line)
+                    j += 1
+                    continue
+                body_indent = len(body_line) - len(body_line.lstrip('\t '))
+                if body_indent <= func_indent:
+                    break
+                body_lines.append(body_line)
+                j += 1
+
+            func_body = '\n'.join(body_lines)
+            calls = extract_function_calls_gdscript(func_body, all_function_names)
+
+            func_info = {'line': i + 1, 'signature': signature}
+            if doc:
+                func_info['doc'] = doc
+            if calls:
+                func_info['calls'] = calls
+
+            # Assign to inner class if indented inside one
+            if func_indent > 0:
+                parent_class = None
+                for ci in range(i - 1, -1, -1):
+                    pcm = inner_class_pattern.match(lines[ci])
+                    if pcm:
+                        pcm_indent = len(pcm.group(1))
+                        if pcm_indent < func_indent:
+                            parent_class = pcm.group(2)
+                            break
+                if parent_class and parent_class in result['classes']:
+                    result['classes'][parent_class]['methods'][func_name] = func_info
+                else:
+                    result['functions'][func_name] = func_info
+            else:
+                result['functions'][func_name] = func_info
+
+            i = j
+            continue
+
+        i += 1
+
+    # Strip empty collections
+    for key in ('imports', 'constants', 'variables', 'signals', 'enums'):
+        if not result[key]:
+            del result[key]
+    if not result['classes']:
+        del result['classes']
+
     return result
 
 
